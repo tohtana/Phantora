@@ -372,6 +372,26 @@ impl TorchEstimator {
                 self.cache(result);
                 dur
             }
+            TorchCallInfo::CrossEntropyLoss(info, t_info) => {
+                let t = self.allocate(info);
+                let tgt = self.allocate(t_info);
+                let (result, dur) =
+                    estimate_torch!(niter, t.cross_entropy_loss(&tgt, None::<Tensor>, tch::Reduction::Mean, -100, 0.0));
+                self.cache(result);
+                dur
+            }
+            TorchCallInfo::NllLossBackward(info) => {
+                let t = self.allocate(info);
+                let (result, dur) = estimate_torch!(niter, t.zeros_like());
+                self.cache(result);
+                dur
+            }
+            TorchCallInfo::Mean(info) => {
+                let t = self.allocate(info);
+                let (result, dur) = estimate_torch!(niter, t.mean(info.dtype));
+                self.cache(result);
+                dur
+            }
             TorchCallInfo::Sum(info) => {
                 let t = self.allocate(info);
                 let (result, dur) = estimate_torch!(niter, t.sum(info.dtype));

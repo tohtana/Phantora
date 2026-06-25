@@ -777,6 +777,46 @@ impl TorchCallMsg {
                     None
                 }
             },
+            "aten::cross_entropy_loss" => match self.args.as_slice() {
+                [Tensor(shape, kind, _), Tensor(t_shape, t_kind, _), ..] => {
+                    Some(TorchCallInfo::CrossEntropyLoss(
+                        TensorInfo {
+                            shape: shape.clone(),
+                            dtype: *kind,
+                        },
+                        TensorInfo {
+                            shape: t_shape.clone(),
+                            dtype: *t_kind,
+                        },
+                    ))
+                }
+                _ => {
+                    log::warn!("{} args not match: {:?}", self.name, self.args);
+                    None
+                }
+            },
+            "aten::nll_loss_backward" => match self.args.as_slice() {
+                [Tensor(_g_shape, _g_kind, _), Tensor(shape, kind, _), ..] => {
+                    Some(TorchCallInfo::NllLossBackward(TensorInfo {
+                        shape: shape.clone(),
+                        dtype: *kind,
+                    }))
+                }
+                _ => {
+                    log::warn!("{} args not match: {:?}", self.name, self.args);
+                    None
+                }
+            },
+            "aten::mean" => match self.args.as_slice() {
+                [Tensor(shape, kind, _), ..] => Some(TorchCallInfo::Mean(TensorInfo {
+                    shape: shape.clone(),
+                    dtype: *kind,
+                })),
+                _ => {
+                    log::warn!("{} args not match: {:?}", self.name, self.args);
+                    None
+                }
+            },
             "aten::sum" => match self.args.as_slice() {
                 [Tensor(shape, kind, _), ..] => Some(TorchCallInfo::Sum(TensorInfo {
                     shape: shape.clone(),
@@ -1059,6 +1099,9 @@ pub enum TorchCallInfo {
     ToCopyUpcast(TensorInfo),
     LogSoftmax(TensorInfo, i64),
     LogSoftmaxBackward(TensorInfo, TensorInfo, i64),
+    CrossEntropyLoss(TensorInfo, TensorInfo),
+    NllLossBackward(TensorInfo),
+    Mean(TensorInfo),
     Sum(TensorInfo),
     Sqrt(TensorInfo),
     Softmax(TensorInfo, i64),
