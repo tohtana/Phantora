@@ -707,6 +707,116 @@ impl TorchCallMsg {
                     None
                 }
             },
+            "aten::silu" => match self.args.as_slice() {
+                [Tensor(shape, kind, _), ..] => Some(TorchCallInfo::Silu(TensorInfo {
+                    shape: shape.clone(),
+                    dtype: *kind,
+                })),
+                _ => {
+                    log::warn!("{} args not match: {:?}", self.name, self.args);
+                    None
+                }
+            },
+            "aten::silu_backward" => match self.args.as_slice() {
+                [Tensor(g_shape, g_kind, _), Tensor(s_shape, s_kind, _), ..] => {
+                    Some(TorchCallInfo::SiluBackward(
+                        TensorInfo {
+                            shape: g_shape.clone(),
+                            dtype: *g_kind,
+                        },
+                        TensorInfo {
+                            shape: s_shape.clone(),
+                            dtype: *s_kind,
+                        },
+                    ))
+                }
+                _ => {
+                    log::warn!("{} args not match: {:?}", self.name, self.args);
+                    None
+                }
+            },
+            "aten::_to_copy" => match self.args.as_slice() {
+                [Tensor(shape, kind, _), ..] => Some(TorchCallInfo::ToCopyUpcast(TensorInfo {
+                    shape: shape.clone(),
+                    dtype: *kind,
+                })),
+                _ => {
+                    log::warn!("{} args not match: {:?}", self.name, self.args);
+                    None
+                }
+            },
+            "aten::_log_softmax" => match self.args.as_slice() {
+                [Tensor(shape, kind, _), Int(dim), ..] => Some(TorchCallInfo::LogSoftmax(
+                    TensorInfo {
+                        shape: shape.clone(),
+                        dtype: *kind,
+                    },
+                    *dim,
+                )),
+                _ => {
+                    log::warn!("{} args not match: {:?}", self.name, self.args);
+                    None
+                }
+            },
+            "aten::_log_softmax_backward_data" => match self.args.as_slice() {
+                [Tensor(shape1, kind1, _), Tensor(shape2, kind2, _), Int(dim), ..] => {
+                    Some(TorchCallInfo::LogSoftmaxBackward(
+                        TensorInfo {
+                            shape: shape1.clone(),
+                            dtype: *kind1,
+                        },
+                        TensorInfo {
+                            shape: shape2.clone(),
+                            dtype: *kind2,
+                        },
+                        *dim,
+                    ))
+                }
+                _ => {
+                    log::warn!("{} args not match: {:?}", self.name, self.args);
+                    None
+                }
+            },
+            "aten::cross_entropy_loss" => match self.args.as_slice() {
+                [Tensor(shape, kind, _), Tensor(t_shape, t_kind, _), ..] => {
+                    Some(TorchCallInfo::CrossEntropyLoss(
+                        TensorInfo {
+                            shape: shape.clone(),
+                            dtype: *kind,
+                        },
+                        TensorInfo {
+                            shape: t_shape.clone(),
+                            dtype: *t_kind,
+                        },
+                    ))
+                }
+                _ => {
+                    log::warn!("{} args not match: {:?}", self.name, self.args);
+                    None
+                }
+            },
+            "aten::nll_loss_backward" => match self.args.as_slice() {
+                [Tensor(_g_shape, _g_kind, _), Tensor(shape, kind, _), ..] => {
+                    Some(TorchCallInfo::NllLossBackward(TensorInfo {
+                        shape: shape.clone(),
+                        dtype: *kind,
+                    }))
+                }
+                _ => {
+                    log::warn!("{} args not match: {:?}", self.name, self.args);
+                    None
+                }
+            },
+            "aten::mean" => match self.args.as_slice() {
+                [Tensor(shape, kind, _), ..] => Some(TorchCallInfo::Mean(TensorInfo {
+                    shape: shape.clone(),
+                    dtype: *kind,
+                })),
+                _ => {
+                    log::warn!("{} args not match: {:?}", self.name, self.args);
+                    None
+                }
+            },
             "aten::sum" => match self.args.as_slice() {
                 [Tensor(shape, kind, _), ..] => Some(TorchCallInfo::Sum(TensorInfo {
                     shape: shape.clone(),
@@ -925,7 +1035,10 @@ impl TorchCallMsg {
                 }
                 _ => None,
             },
-            _ => None,
+            other => {
+                log::warn!("PHANTORA_DROPPED_OP {} args={:?}", other, self.args);
+                None
+            }
         };
         call_info.map(|info| TorchCall {
             time: self.curr_time,
@@ -981,6 +1094,14 @@ pub enum TorchCallInfo {
     WhereScalar(TensorInfo, TensorInfo),
     Gelu(TensorInfo),
     GeluBackward(TensorInfo, TensorInfo),
+    Silu(TensorInfo),
+    SiluBackward(TensorInfo, TensorInfo),
+    ToCopyUpcast(TensorInfo),
+    LogSoftmax(TensorInfo, i64),
+    LogSoftmaxBackward(TensorInfo, TensorInfo, i64),
+    CrossEntropyLoss(TensorInfo, TensorInfo),
+    NllLossBackward(TensorInfo),
+    Mean(TensorInfo),
     Sum(TensorInfo),
     Sqrt(TensorInfo),
     Softmax(TensorInfo, i64),
