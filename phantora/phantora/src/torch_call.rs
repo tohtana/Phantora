@@ -700,7 +700,7 @@ impl TorchCallMsg {
                 }
             },
             "aten::cat" => match self.args.as_slice() {
-                [List(elements), Int(dim)] => match maybe_tensor_list(elements) {
+                [List(elements), Int(dim), ..] => match maybe_tensor_list(elements) {
                     Some(tensors) => Some(TorchCallInfo::Cat(tensors, *dim)),
                     None => {
                         log::warn!("{} args not match: {:?}", self.name, self.args);
