@@ -679,6 +679,39 @@ impl TorchCallMsg {
                     None
                 }
             },
+            "aten::rsqrt" => match self.args.as_slice() {
+                [Tensor(shape, kind, _)] => Some(TorchCallInfo::Rsqrt(TensorInfo {
+                    shape: shape.clone(),
+                    dtype: *kind,
+                })),
+                _ => {
+                    log::warn!("{} args not match: {:?}", self.name, self.args);
+                    None
+                }
+            },
+            "aten::neg" => match self.args.as_slice() {
+                [Tensor(shape, kind, _)] => Some(TorchCallInfo::Neg(TensorInfo {
+                    shape: shape.clone(),
+                    dtype: *kind,
+                })),
+                _ => {
+                    log::warn!("{} args not match: {:?}", self.name, self.args);
+                    None
+                }
+            },
+            "aten::cat" => match self.args.as_slice() {
+                [List(elements), Int(dim), ..] => match maybe_tensor_list(elements) {
+                    Some(tensors) => Some(TorchCallInfo::Cat(tensors, *dim)),
+                    None => {
+                        log::warn!("{} args not match: {:?}", self.name, self.args);
+                        None
+                    }
+                },
+                _ => {
+                    log::warn!("{} args not match: {:?}", self.name, self.args);
+                    None
+                }
+            },
             "aten::gelu" => match self.args.as_slice() {
                 [Tensor(shape, kind, _), ..] => Some(TorchCallInfo::Gelu(TensorInfo {
                     shape: shape.clone(),
@@ -1035,6 +1068,40 @@ impl TorchCallMsg {
                 }
                 _ => None,
             },
+            "aten::detach"
+            | "aten::detach_"
+            | "aten::view"
+            | "aten::reshape"
+            | "aten::transpose"
+            | "aten::t"
+            | "aten::unsqueeze"
+            | "aten::squeeze"
+            | "aten::slice"
+            | "aten::narrow"
+            | "aten::slice_backward"
+            | "aten::chunk"
+            | "aten::expand"
+            | "aten::record_stream"
+            | "aten::_has_compatible_shallow_copy_type"
+            | "aten::flatten_dense_tensors"
+            | "aten::unflatten_dense_tensors"
+            | "aten::lift_fresh"
+            | "aten::logical_or"
+            | "aten::isnan"
+            | "aten::isinf"
+            | "aten::copy_"
+            | "aten::div_"
+            | "aten::linalg_vector_norm"
+            | "aten::sin"
+            | "aten::cos"
+            | "aten::ones_like"
+            | "aten::embedding"
+            | "aten::embedding_backward"
+            | "aten::stack"
+            | "aten::_foreach_sqrt"
+            | "aten::_foreach_lerp_"
+            | "aten::_foreach_div_"
+            | "aten::_foreach_add_" => None,
             other => {
                 log::warn!("PHANTORA_DROPPED_OP {} args={:?}", other, self.args);
                 None
@@ -1104,6 +1171,9 @@ pub enum TorchCallInfo {
     Mean(TensorInfo),
     Sum(TensorInfo),
     Sqrt(TensorInfo),
+    Rsqrt(TensorInfo),
+    Neg(TensorInfo),
+    Cat(Vec<TensorInfo>, i64),
     Softmax(TensorInfo, i64),
     SoftmaxBackward(TensorInfo, TensorInfo, i64),
     ZerosLike(TensorInfo),

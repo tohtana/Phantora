@@ -404,6 +404,25 @@ impl TorchEstimator {
                 self.cache(result);
                 dur
             }
+            TorchCallInfo::Rsqrt(info) => {
+                let t = self.allocate(info);
+                let (result, dur) = estimate_torch!(niter, t.rsqrt());
+                self.cache(result);
+                dur
+            }
+            TorchCallInfo::Neg(info) => {
+                let t = self.allocate(info);
+                let (result, dur) = estimate_torch!(niter, t.neg());
+                self.cache(result);
+                dur
+            }
+            TorchCallInfo::Cat(infos, dim) => {
+                let tensors: Vec<_> = infos.iter().map(|info| self.allocate(info)).collect();
+                let tensor_refs: Vec<_> = tensors.iter().collect();
+                let (result, dur) = estimate_torch!(niter, Tensor::cat(&tensor_refs, *dim));
+                self.cache(result);
+                dur
+            }
             TorchCallInfo::Softmax(info, dim) => {
                 let t = self.allocate(info);
                 let (result, dur) = estimate_torch!(niter, t.softmax(*dim, info.dtype));
