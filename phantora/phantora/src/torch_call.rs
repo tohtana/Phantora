@@ -679,6 +679,39 @@ impl TorchCallMsg {
                     None
                 }
             },
+            "aten::rsqrt" => match self.args.as_slice() {
+                [Tensor(shape, kind, _)] => Some(TorchCallInfo::Rsqrt(TensorInfo {
+                    shape: shape.clone(),
+                    dtype: *kind,
+                })),
+                _ => {
+                    log::warn!("{} args not match: {:?}", self.name, self.args);
+                    None
+                }
+            },
+            "aten::neg" => match self.args.as_slice() {
+                [Tensor(shape, kind, _)] => Some(TorchCallInfo::Neg(TensorInfo {
+                    shape: shape.clone(),
+                    dtype: *kind,
+                })),
+                _ => {
+                    log::warn!("{} args not match: {:?}", self.name, self.args);
+                    None
+                }
+            },
+            "aten::cat" => match self.args.as_slice() {
+                [List(elements), Int(dim)] => match maybe_tensor_list(elements) {
+                    Some(tensors) => Some(TorchCallInfo::Cat(tensors, *dim)),
+                    None => {
+                        log::warn!("{} args not match: {:?}", self.name, self.args);
+                        None
+                    }
+                },
+                _ => {
+                    log::warn!("{} args not match: {:?}", self.name, self.args);
+                    None
+                }
+            },
             "aten::gelu" => match self.args.as_slice() {
                 [Tensor(shape, kind, _), ..] => Some(TorchCallInfo::Gelu(TensorInfo {
                     shape: shape.clone(),
@@ -1035,6 +1068,16 @@ impl TorchCallMsg {
                 }
                 _ => None,
             },
+            "aten::detach"
+            | "aten::view"
+            | "aten::reshape"
+            | "aten::transpose"
+            | "aten::t"
+            | "aten::unsqueeze"
+            | "aten::squeeze"
+            | "aten::slice"
+            | "aten::expand"
+            | "aten::_has_compatible_shallow_copy_type" => None,
             other => {
                 log::warn!("PHANTORA_DROPPED_OP {} args={:?}", other, self.args);
                 None
@@ -1104,6 +1147,9 @@ pub enum TorchCallInfo {
     Mean(TensorInfo),
     Sum(TensorInfo),
     Sqrt(TensorInfo),
+    Rsqrt(TensorInfo),
+    Neg(TensorInfo),
+    Cat(Vec<TensorInfo>, i64),
     Softmax(TensorInfo, i64),
     SoftmaxBackward(TensorInfo, TensorInfo, i64),
     ZerosLike(TensorInfo),
