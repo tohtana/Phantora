@@ -1069,6 +1069,7 @@ impl TorchCallMsg {
                 _ => None,
             },
             "aten::detach"
+            | "aten::detach_"
             | "aten::view"
             | "aten::reshape"
             | "aten::transpose"
@@ -1076,8 +1077,31 @@ impl TorchCallMsg {
             | "aten::unsqueeze"
             | "aten::squeeze"
             | "aten::slice"
+            | "aten::narrow"
+            | "aten::slice_backward"
+            | "aten::chunk"
             | "aten::expand"
-            | "aten::_has_compatible_shallow_copy_type" => None,
+            | "aten::record_stream"
+            | "aten::_has_compatible_shallow_copy_type"
+            | "aten::flatten_dense_tensors"
+            | "aten::unflatten_dense_tensors"
+            | "aten::lift_fresh"
+            | "aten::logical_or"
+            | "aten::isnan"
+            | "aten::isinf"
+            | "aten::copy_"
+            | "aten::div_"
+            | "aten::linalg_vector_norm"
+            | "aten::sin"
+            | "aten::cos"
+            | "aten::ones_like"
+            | "aten::embedding"
+            | "aten::embedding_backward"
+            | "aten::stack"
+            | "aten::_foreach_sqrt"
+            | "aten::_foreach_lerp_"
+            | "aten::_foreach_div_"
+            | "aten::_foreach_add_" => None,
             other => {
                 log::warn!("PHANTORA_DROPPED_OP {} args={:?}", other, self.args);
                 None
