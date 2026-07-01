@@ -10,6 +10,7 @@ use cuda_call::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::env;
 use std::hash::Hash;
 use std::mem;
 use std::os::unix::net::UnixDatagram;
@@ -225,6 +226,7 @@ struct P2PFlowEndpoint {
 }
 
 struct CCWaiting {
+    sequence: u64,
     signature: NcclCollectiveSignature,
     trace: Trace,
     comm_start_meta: EventId,
@@ -241,6 +243,47 @@ fn can_join_collective_waiting(
     signature: NcclCollectiveSignature,
 ) -> bool {
     waiting_signature == signature && !joined_ranks.contains(&rank)
+}
+
+fn nccl_match_trace_enabled() -> bool {
+    matches!(
+        env::var("PHANTORA_NCCL_MATCH_TRACE")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn short_nccl_id(id: &NcclId) -> String {
+    id.0.iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn signature_json(signature: NcclCollectiveSignature) -> serde_json::Value {
+    match signature {
+        NcclCollectiveSignature::Bcast { count, dtype, root } => {
+            serde_json::json!({"op": "bcast", "count": count, "dtype": format!("{dtype:?}"), "root": root})
+        }
+        NcclCollectiveSignature::AllReduce { count, dtype, op } => {
+            serde_json::json!({"op": "all_reduce", "count": count, "dtype": format!("{dtype:?}"), "reduce_op": format!("{op:?}")})
+        }
+        NcclCollectiveSignature::AllGather { count, dtype } => {
+            serde_json::json!({"op": "all_gather", "count": count, "dtype": format!("{dtype:?}")})
+        }
+        NcclCollectiveSignature::ReduceScatter { count, dtype, op } => {
+            serde_json::json!({"op": "reduce_scatter", "count": count, "dtype": format!("{dtype:?}"), "reduce_op": format!("{op:?}")})
+        }
+    }
+}
+
+fn log_nccl_match_trace(event: serde_json::Value) {
+    if nccl_match_trace_enabled() {
+        log::info!("PHANTORA_NCCL_MATCH {event}");
+    }
 }
 
 pub struct Simulator {
@@ -264,6 +307,7 @@ pub struct Simulator {
     allreduce_waiting: HashMap<NcclId, VecDeque<CCWaiting>>,
     allgather_waiting: HashMap<NcclId, VecDeque<CCWaiting>>,
     reduce_scatter_waiting: HashMap<NcclId, VecDeque<CCWaiting>>,
+    next_collective_sequence: HashMap<NcclId, u64>,
     // P2P key = (comm_id, sender_rank, receiver_rank). FIFO queues preserve
     // NCCL's peer ordering for repeated sends/receives.
     send_waiting: HashMap<P2PKey, VecDeque<P2PFlowEndpoint>>,
@@ -326,6 +370,7 @@ impl Simulator {
             allreduce_waiting: HashMap::new(),
             allgather_waiting: HashMap::new(),
             reduce_scatter_waiting: HashMap::new(),
+            next_collective_sequence: HashMap::new(),
             send_waiting: HashMap::new(),
             recv_waiting: HashMap::new(),
         }
@@ -499,6 +544,7 @@ impl Simulator {
                     &mut self.stream_info,
                     &mut self.queue,
                     &mut self.$waiting,
+                    &mut self.next_collective_sequence,
                     host.host,
                     curr_time,
                     $signature,
@@ -1479,6 +1525,7 @@ impl Simulator {
         stream_info: &mut HashMap<(HostId, CudaStream), StreamInfo>,
         queue: &mut EventQueue,
         waiting_map: &mut HashMap<NcclId, VecDeque<CCWaiting>>,
+        next_collective_sequence: &mut HashMap<NcclId, u64>,
         host: HostId,
         curr_time: i64,
         signature: NcclCollectiveSignature,
@@ -1488,7 +1535,27 @@ impl Simulator {
         call: CudaCall,
     ) {
         let nccl_id = NcclId(comm.id);
-        let new_cc_waiting = || {
+        let comm_id = short_nccl_id(&nccl_id);
+        let signature_payload = signature_json(signature);
+        let trace_is_enabled = nccl_match_trace_enabled();
+        if trace_is_enabled {
+            let queue_len = waiting_map.get(&nccl_id).map_or(0, VecDeque::len);
+            log_nccl_match_trace(serde_json::json!({
+                "event": "arrive",
+                "comm_id": comm_id.clone(),
+                "rank": comm.rank,
+                "host": host.hostname.clone(),
+                "pid": host.pid,
+                "stream": {"device": stream.device, "id": stream.id},
+                "curr_time": curr_time,
+                "queue_len": queue_len,
+                "signature": signature_payload.clone(),
+            }));
+        }
+        let mut new_cc_waiting = || {
+            let sequence = next_collective_sequence.entry(nccl_id).or_insert(0);
+            let waiting_sequence = *sequence;
+            *sequence += 1;
             let mut joined_ranks = HashSet::new();
             joined_ranks.insert(comm.rank);
             let mut waiting_for = HashSet::new();
@@ -1525,7 +1592,23 @@ impl Simulator {
                 curr_time,
             );
 
+            let mut waiting_for_log: Vec<_> = waiting_for.iter().copied().collect();
+            waiting_for_log.sort();
+            log_nccl_match_trace(serde_json::json!({
+                "event": "new_waiting",
+                "comm_id": comm_id.clone(),
+                "sequence": waiting_sequence,
+                "rank": comm.rank,
+                "host": host.hostname.clone(),
+                "pid": host.pid,
+                "stream": {"device": stream.device, "id": stream.id},
+                "curr_time": curr_time,
+                "signature": signature_payload.clone(),
+                "waiting_for": waiting_for_log,
+            }));
+
             CCWaiting {
+                sequence: waiting_sequence,
                 signature,
                 trace,
                 comm_start_meta,
@@ -1557,8 +1640,33 @@ impl Simulator {
                 }) {
                     None => waitings.push_back(new_cc_waiting()),
                     Some((idx, waiting)) => {
+                        let mut waiting_for_before: Vec<_> =
+                            waiting.waiting_for.iter().copied().collect();
+                        waiting_for_before.sort();
                         waiting.waiting_for.remove(&comm.rank);
                         waiting.joined_ranks.insert(comm.rank);
+                        let mut waiting_for_after: Vec<_> =
+                            waiting.waiting_for.iter().copied().collect();
+                        waiting_for_after.sort();
+                        let mut joined_ranks: Vec<_> =
+                            waiting.joined_ranks.iter().copied().collect();
+                        joined_ranks.sort();
+
+                        log_nccl_match_trace(serde_json::json!({
+                            "event": "join",
+                            "comm_id": comm_id.clone(),
+                            "sequence": waiting.sequence,
+                            "rank": comm.rank,
+                            "host": host.hostname.clone(),
+                            "pid": host.pid,
+                            "stream": {"device": stream.device, "id": stream.id},
+                            "curr_time": curr_time,
+                            "waiting_index": idx,
+                            "signature": signature_payload.clone(),
+                            "waiting_for_before": waiting_for_before,
+                            "waiting_for_after": waiting_for_after,
+                            "joined_ranks": joined_ranks,
+                        }));
 
                         let stream_start = Self::add_event(
                             torch_estimator,
@@ -1582,6 +1690,18 @@ impl Simulator {
 
                         if waiting.waiting_for.is_empty() {
                             if let Some(waiting) = waitings.remove(idx) {
+                                let mut joined_ranks: Vec<_> =
+                                    waiting.joined_ranks.iter().copied().collect();
+                                joined_ranks.sort();
+                                log_nccl_match_trace(serde_json::json!({
+                                    "event": "complete",
+                                    "comm_id": comm_id.clone(),
+                                    "sequence": waiting.sequence,
+                                    "rank": comm.rank,
+                                    "curr_time": curr_time,
+                                    "signature": signature_payload.clone(),
+                                    "joined_ranks": joined_ranks,
+                                }));
                                 let comm_events: Vec<_> = waiting
                                     .trace
                                     .into_iter()
@@ -1624,6 +1744,7 @@ impl Simulator {
             &mut self.stream_info,
             &mut self.queue,
             &mut self.bcast_waiting,
+            &mut self.next_collective_sequence,
             host.host,
             curr_time,
             NcclCollectiveSignature::Bcast { count, dtype, root },
