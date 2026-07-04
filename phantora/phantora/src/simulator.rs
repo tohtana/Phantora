@@ -163,6 +163,29 @@ struct SplitWaiting {
 
 type P2PKey = (NcclId, i32, i32);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NcclCollectiveSignature {
+    Bcast {
+        count: usize,
+        dtype: NcclDatatype,
+        root: i32,
+    },
+    AllReduce {
+        count: usize,
+        dtype: NcclDatatype,
+        op: cuda_call::NcclReduceOp,
+    },
+    AllGather {
+        count: usize,
+        dtype: NcclDatatype,
+    },
+    ReduceScatter {
+        count: usize,
+        dtype: NcclDatatype,
+        op: cuda_call::NcclReduceOp,
+    },
+}
+
 #[derive(Clone, Copy)]
 enum P2PCallKind {
     Send,
@@ -202,12 +225,22 @@ struct P2PFlowEndpoint {
 }
 
 struct CCWaiting {
+    signature: NcclCollectiveSignature,
     trace: Trace,
     comm_start_meta: EventId,
     comm_end_meta: EventId,
     comm_barrier: EventId,
     joined_ranks: HashSet<i32>,
     waiting_for: HashSet<i32>,
+}
+
+fn can_join_collective_waiting(
+    waiting_signature: NcclCollectiveSignature,
+    joined_ranks: &HashSet<i32>,
+    rank: i32,
+    signature: NcclCollectiveSignature,
+) -> bool {
+    waiting_signature == signature && !joined_ranks.contains(&rank)
 }
 
 pub struct Simulator {
@@ -457,7 +490,7 @@ impl Simulator {
         let call = msg.call.clone();
 
         macro_rules! handle_nccl_op {
-            ($op:ident, $waiting:ident, $count: expr, $dtype:expr, $comm:expr, $stream:expr $(,)?) => {{
+            ($op:ident, $waiting:ident, $signature:expr, $count: expr, $dtype:expr, $comm:expr, $stream:expr $(,)?) => {{
                 let ranks = &self.comm_groups[&NcclId($comm.id)];
                 let trace = self.nccl_ops.$op(ranks, $count, $dtype);
                 Self::nccl_call(
@@ -468,6 +501,7 @@ impl Simulator {
                     &mut self.$waiting,
                     host.host,
                     curr_time,
+                    $signature,
                     trace,
                     $comm,
                     $stream,
@@ -554,25 +588,42 @@ impl Simulator {
             CudaCall::NcclAllReduce {
                 count,
                 dtype,
-                op: _,
+                op,
                 comm,
                 stream,
-            } => handle_nccl_op!(allreduce, allreduce_waiting, count, dtype, comm, stream,),
+            } => handle_nccl_op!(
+                allreduce,
+                allreduce_waiting,
+                NcclCollectiveSignature::AllReduce { count, dtype, op },
+                count,
+                dtype,
+                comm,
+                stream,
+            ),
             CudaCall::NcclAllGather {
                 count,
                 dtype,
                 comm,
                 stream,
-            } => handle_nccl_op!(allgather, allgather_waiting, count, dtype, comm, stream,),
+            } => handle_nccl_op!(
+                allgather,
+                allgather_waiting,
+                NcclCollectiveSignature::AllGather { count, dtype },
+                count,
+                dtype,
+                comm,
+                stream,
+            ),
             CudaCall::NcclReduceScatter {
                 count,
                 dtype,
-                op: _,
+                op,
                 comm,
                 stream,
             } => handle_nccl_op!(
                 reduce_scatter,
                 reduce_scatter_waiting,
+                NcclCollectiveSignature::ReduceScatter { count, dtype, op },
                 count,
                 dtype,
                 comm,
@@ -1430,6 +1481,7 @@ impl Simulator {
         waiting_map: &mut HashMap<NcclId, VecDeque<CCWaiting>>,
         host: HostId,
         curr_time: i64,
+        signature: NcclCollectiveSignature,
         trace: Trace,
         comm: NcclComm,
         stream: CudaStream,
@@ -1474,6 +1526,7 @@ impl Simulator {
             );
 
             CCWaiting {
+                signature,
                 trace,
                 comm_start_meta,
                 comm_end_meta,
@@ -1491,10 +1544,15 @@ impl Simulator {
             }
             Some(waitings) => {
                 match waitings.iter_mut().enumerate().find_map(|(i, waiting)| {
-                    if waiting.joined_ranks.contains(&comm.rank) {
-                        None
-                    } else {
+                    if can_join_collective_waiting(
+                        waiting.signature,
+                        &waiting.joined_ranks,
+                        comm.rank,
+                        signature,
+                    ) {
                         Some((i, waiting))
+                    } else {
+                        None
                     }
                 }) {
                     None => waitings.push_back(new_cc_waiting()),
@@ -1568,6 +1626,7 @@ impl Simulator {
             &mut self.bcast_waiting,
             host.host,
             curr_time,
+            NcclCollectiveSignature::Bcast { count, dtype, root },
             trace,
             comm,
             stream,
@@ -1594,5 +1653,103 @@ impl Simulator {
     pub fn handle_exit(&mut self, host: ResponseId, curr_time: i64) {
         log::debug!("{:?} exited at {}", host, curr_time);
         self.exited_hosts.insert(host.host, curr_time);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cuda_call::{NcclDatatype, NcclReduceOp};
+
+    fn joined_ranks(ranks: &[i32]) -> HashSet<i32> {
+        ranks.iter().copied().collect()
+    }
+
+    #[test]
+    fn collective_waiting_requires_matching_allgather_signature() {
+        let waiting = NcclCollectiveSignature::AllGather {
+            count: 512,
+            dtype: NcclDatatype::Bf16,
+        };
+
+        assert!(can_join_collective_waiting(
+            waiting,
+            &joined_ranks(&[0, 1]),
+            2,
+            NcclCollectiveSignature::AllGather {
+                count: 512,
+                dtype: NcclDatatype::Bf16,
+            },
+        ));
+        assert!(!can_join_collective_waiting(
+            waiting,
+            &joined_ranks(&[0, 1]),
+            1,
+            waiting,
+        ));
+        assert!(!can_join_collective_waiting(
+            waiting,
+            &joined_ranks(&[0, 1]),
+            2,
+            NcclCollectiveSignature::AllGather {
+                count: 1024,
+                dtype: NcclDatatype::Bf16,
+            },
+        ));
+        assert!(!can_join_collective_waiting(
+            waiting,
+            &joined_ranks(&[0, 1]),
+            2,
+            NcclCollectiveSignature::AllGather {
+                count: 512,
+                dtype: NcclDatatype::F32,
+            },
+        ));
+    }
+
+    #[test]
+    fn collective_waiting_distinguishes_other_collective_metadata() {
+        assert!(!can_join_collective_waiting(
+            NcclCollectiveSignature::Bcast {
+                count: 1,
+                dtype: NcclDatatype::I32,
+                root: 0,
+            },
+            &joined_ranks(&[0]),
+            1,
+            NcclCollectiveSignature::Bcast {
+                count: 1,
+                dtype: NcclDatatype::I32,
+                root: 1,
+            },
+        ));
+        assert!(!can_join_collective_waiting(
+            NcclCollectiveSignature::AllReduce {
+                count: 8,
+                dtype: NcclDatatype::F32,
+                op: NcclReduceOp::Sum,
+            },
+            &joined_ranks(&[]),
+            0,
+            NcclCollectiveSignature::AllReduce {
+                count: 8,
+                dtype: NcclDatatype::F32,
+                op: NcclReduceOp::Max,
+            },
+        ));
+        assert!(!can_join_collective_waiting(
+            NcclCollectiveSignature::ReduceScatter {
+                count: 16,
+                dtype: NcclDatatype::Bf16,
+                op: NcclReduceOp::Sum,
+            },
+            &joined_ranks(&[]),
+            0,
+            NcclCollectiveSignature::ReduceScatter {
+                count: 32,
+                dtype: NcclDatatype::Bf16,
+                op: NcclReduceOp::Sum,
+            },
+        ));
     }
 }
