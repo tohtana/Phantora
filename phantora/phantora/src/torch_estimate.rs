@@ -375,8 +375,10 @@ impl TorchEstimator {
             TorchCallInfo::CrossEntropyLoss(info, t_info) => {
                 let t = self.allocate(info);
                 let tgt = self.allocate(t_info);
-                let (result, dur) =
-                    estimate_torch!(niter, t.cross_entropy_loss(&tgt, None::<Tensor>, tch::Reduction::Mean, -100, 0.0));
+                let (result, dur) = estimate_torch!(
+                    niter,
+                    t.cross_entropy_loss(&tgt, None::<Tensor>, tch::Reduction::Mean, -100, 0.0)
+                );
                 self.cache(result);
                 dur
             }
@@ -455,19 +457,21 @@ impl TorchEstimator {
                 q,
                 k,
                 v,
+                mask,
                 causal,
                 gqa,
             } => {
                 let t_q = self.allocate(q);
                 let t_k = self.allocate(k);
                 let t_v = self.allocate(v);
+                let t_mask = mask.as_ref().map(|info| self.allocate(info));
                 let (result, dur) = estimate_torch!(
                     niter,
                     Tensor::f_scaled_dot_product_attention(
                         &t_q,
                         &t_k,
                         &t_v,
-                        None::<Tensor>,
+                        t_mask.as_ref(),
                         0.0,
                         *causal,
                         None,
@@ -476,6 +480,35 @@ impl TorchEstimator {
                     .unwrap()
                 );
                 self.cache(result);
+                dur
+            }
+            TorchCallInfo::SDPAEfficientBackward {
+                q,
+                k,
+                v,
+                bias,
+                causal,
+            } => {
+                // Build the forward graph via autograd, then time only the backward.
+                let t_q = self.allocate(q).detach().set_requires_grad(true);
+                let t_k = self.allocate(k).detach().set_requires_grad(true);
+                let t_v = self.allocate(v).detach().set_requires_grad(true);
+                let t_bias = bias.as_ref().map(|info| self.allocate(info));
+                let out = Tensor::scaled_dot_product_attention(
+                    &t_q,
+                    &t_k,
+                    &t_v,
+                    t_bias.as_ref(),
+                    0.0,
+                    *causal,
+                    None,
+                    false,
+                )
+                .sum(Kind::Float);
+                let (_, dur) = estimate_torch!(
+                    niter,
+                    Tensor::run_backward(&[&out], &[&t_q, &t_k, &t_v], true, false)
+                );
                 dur
             }
             TorchCallInfo::SDPABackward {
