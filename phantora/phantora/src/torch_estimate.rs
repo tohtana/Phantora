@@ -30,6 +30,16 @@ fn kind_range(kind: Kind) -> KindRange {
     }
 }
 
+fn tensor_cache_key(info: &TensorInfo) -> Option<(i64, Kind)> {
+    match kind_range(info.dtype) {
+        KindRange::Float => Some((info.shape.iter().product(), info.dtype)),
+        // Integer and boolean contents can determine indices, masks, reduction
+        // sizes, and control flow. Reusing them by only (numel, dtype) aliases
+        // unrelated semantics, so value-sensitive tensors are always fresh.
+        KindRange::Integer | KindRange::Bool => None,
+    }
+}
+
 fn allocate_class_index_target(
     input_info: &TensorInfo,
     target_info: &TensorInfo,
@@ -88,22 +98,29 @@ impl TorchEstimator {
         }
     }
 
-    fn allocate(&mut self, info: &TensorInfo) -> Tensor {
+    fn allocate_on(&mut self, info: &TensorInfo, device: Device) -> Tensor {
         let shape = info.shape.as_slice();
         let kind = info.dtype;
-        let total_size = shape.iter().product();
-        match self.tensor_cache.get(&(total_size, kind)) {
-            Some(t) => t.contiguous().view(shape),
-            None => {
-                let t = match kind_range(kind) {
-                    KindRange::Bool => Tensor::randint(2, shape, (kind, Device::Cuda(0))),
-                    KindRange::Integer => Tensor::randint(128, shape, (kind, Device::Cuda(0))),
-                    KindRange::Float => Tensor::randn(shape, (kind, Device::Cuda(0))),
-                };
-                self.tensor_cache.put((total_size, kind), t.contiguous());
-                t
+        let cache_key = tensor_cache_key(info);
+        if let Some(key) = cache_key {
+            if let Some(t) = self.tensor_cache.get(&key) {
+                return t.contiguous().view(shape);
             }
         }
+
+        let t = match kind_range(kind) {
+            KindRange::Bool => Tensor::randint(2, shape, (kind, device)),
+            KindRange::Integer => Tensor::randint(128, shape, (kind, device)),
+            KindRange::Float => Tensor::randn(shape, (kind, device)),
+        };
+        if let Some(key) = cache_key {
+            self.tensor_cache.put(key, t.contiguous());
+        }
+        t
+    }
+
+    fn allocate(&mut self, info: &TensorInfo) -> Tensor {
+        self.allocate_on(info, Device::Cuda(0))
     }
 
     fn allocate_list(&mut self, info: &[TensorInfo]) -> Vec<Tensor> {
@@ -112,9 +129,14 @@ impl TorchEstimator {
 
     fn cache(&mut self, t: Tensor) {
         if let Device::Cuda(0) = t.device() {
-            let total_size = t.size().iter().product();
             let kind = t.kind();
-            self.tensor_cache.put((total_size, kind), t.contiguous());
+            let info = TensorInfo {
+                shape: t.size(),
+                dtype: kind,
+            };
+            if let Some(key) = tensor_cache_key(&info) {
+                self.tensor_cache.put(key, t.contiguous());
+            }
         }
     }
 
@@ -706,9 +728,9 @@ mod tests {
         let cached = Tensor::from_slice(&[-100_i64, 0, 3, 127]);
         estimator.tensor_cache.put((4, Kind::Int64), cached);
 
-        let unsafe_cached_target = estimator.allocate(&target_info);
-        assert_eq!(unsafe_cached_target.int64_value(&[0]), -100);
-        assert_eq!(unsafe_cached_target.int64_value(&[3]), 127);
+        let fresh_integer = estimator.allocate_on(&target_info, Device::Cpu);
+        assert_ne!(fresh_integer.int64_value(&[0]), -100);
+        assert!(fresh_integer.int64_value(&[3]) < 128);
 
         let target = allocate_class_index_target(&input_info, &target_info, Device::Cpu);
         assert_all_targets_in_range(&target, 3);
@@ -734,11 +756,31 @@ mod tests {
             .tensor_cache
             .put((sequence_length, Kind::Int64), unrelated);
 
-        let unsafe_cached_target = estimator.allocate(&target_info);
-        assert_eq!(unsafe_cached_target.int64_value(&[0]), n_classes);
+        let fresh_integer = estimator.allocate_on(&target_info, Device::Cpu);
+        assert_ne!(fresh_integer.int64_value(&[0]), n_classes);
 
         let target = allocate_class_index_target(&input_info, &target_info, Device::Cpu);
         assert_all_targets_in_range(&target, n_classes);
         assert_eq!(target.size(), target_info.shape);
+    }
+
+    #[test]
+    fn tensor_cache_is_float_only() {
+        for dtype in [Kind::Bool, Kind::Int, Kind::Int64] {
+            assert_eq!(
+                tensor_cache_key(&TensorInfo {
+                    shape: vec![1, 8192],
+                    dtype,
+                }),
+                None
+            );
+        }
+        assert_eq!(
+            tensor_cache_key(&TensorInfo {
+                shape: vec![1, 8192],
+                dtype: Kind::BFloat16,
+            }),
+            Some((8192, Kind::BFloat16))
+        );
     }
 }
