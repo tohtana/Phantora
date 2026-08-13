@@ -30,6 +30,27 @@ fn kind_range(kind: Kind) -> KindRange {
     }
 }
 
+fn allocate_class_index_target(
+    input_info: &TensorInfo,
+    target_info: &TensorInfo,
+    device: Device,
+) -> Tensor {
+    let class_dimension = if input_info.shape.len() == 1 { 0 } else { 1 };
+    let n_classes = *input_info
+        .shape
+        .get(class_dimension)
+        .expect("cross-entropy input must have a class dimension");
+    assert!(
+        n_classes > 0,
+        "cross-entropy class dimension must be positive"
+    );
+
+    // Class-index targets affect the loss value, not the measured kernel shape.
+    // Allocate them independently so unrelated integer tensors with the same
+    // (numel, dtype) cache key can never become invalid class indices.
+    Tensor::zeros(target_info.shape.as_slice(), (target_info.dtype, device))
+}
+
 /// Measure a torch op with `n` warmup + 1 measured iteration.
 /// Skips `tch::autocast` when inputs are already bf16/fp16 — autocast
 /// adds ~6× dispatch overhead for tensors that won't be dtype-converted,
@@ -374,7 +395,12 @@ impl TorchEstimator {
             }
             TorchCallInfo::CrossEntropyLoss(info, t_info) => {
                 let t = self.allocate(info);
-                let tgt = self.allocate(t_info);
+                let tgt = match kind_range(t_info.dtype) {
+                    KindRange::Integer => {
+                        allocate_class_index_target(info, t_info, Device::Cuda(0))
+                    }
+                    _ => self.allocate(t_info),
+                };
                 let (result, dur) = estimate_torch!(
                     niter,
                     t.cross_entropy_loss(&tgt, None::<Tensor>, tch::Reduction::Mean, -100, 0.0)
@@ -640,5 +666,79 @@ impl TorchEstimator {
             self.sequence_cache.insert(seq_hash, durs.clone());
             durs
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn estimator_without_cuda() -> TorchEstimator {
+        TorchEstimator {
+            tensor_cache: LruCache::new(NonZeroUsize::new(32).unwrap()),
+            compute_cache: HashMap::new(),
+            sequence_cache: BTreeMap::new(),
+        }
+    }
+
+    fn assert_all_targets_in_range(target: &Tensor, n_classes: i64) {
+        let numel: i64 = target.size().iter().product();
+        for index in 0..numel {
+            let value = target.int64_value(&[index]);
+            assert!(
+                (0..n_classes).contains(&value),
+                "target {value} at index {index} is outside [0, {n_classes})"
+            );
+        }
+    }
+
+    #[test]
+    fn class_index_targets_ignore_arbitrary_cached_integer_contents() {
+        let input_info = TensorInfo {
+            shape: vec![4, 3],
+            dtype: Kind::Float,
+        };
+        let target_info = TensorInfo {
+            shape: vec![4],
+            dtype: Kind::Int64,
+        };
+        let mut estimator = estimator_without_cuda();
+        let cached = Tensor::from_slice(&[-100_i64, 0, 3, 127]);
+        estimator.tensor_cache.put((4, Kind::Int64), cached);
+
+        let unsafe_cached_target = estimator.allocate(&target_info);
+        assert_eq!(unsafe_cached_target.int64_value(&[0]), -100);
+        assert_eq!(unsafe_cached_target.int64_value(&[3]), 127);
+
+        let target = allocate_class_index_target(&input_info, &target_info, Device::Cpu);
+        assert_all_targets_in_range(&target, 3);
+        assert_eq!(target.int64_value(&[0]), 0);
+        assert_eq!(target.int64_value(&[3]), 0);
+    }
+
+    #[test]
+    fn mb1_flattened_target_does_not_alias_same_numel_integer_cache_entry() {
+        let sequence_length = 8192;
+        let n_classes = 100_278;
+        let input_info = TensorInfo {
+            shape: vec![sequence_length, n_classes],
+            dtype: Kind::BFloat16,
+        };
+        let target_info = TensorInfo {
+            shape: vec![sequence_length],
+            dtype: Kind::Int64,
+        };
+        let mut estimator = estimator_without_cuda();
+        let unrelated = Tensor::full(&[1, sequence_length], n_classes, (Kind::Int64, Device::Cpu));
+        estimator
+            .tensor_cache
+            .put((sequence_length, Kind::Int64), unrelated);
+
+        let unsafe_cached_target = estimator.allocate(&target_info);
+        assert_eq!(unsafe_cached_target.int64_value(&[0]), n_classes);
+
+        let target = allocate_class_index_target(&input_info, &target_info, Device::Cpu);
+        assert_all_targets_in_range(&target, n_classes);
+        assert_eq!(target.size(), target_info.shape);
     }
 }
